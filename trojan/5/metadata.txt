@@ -1,0 +1,27 @@
+Category: Denial-of-Service
+Target: uart_core
+
+Trigger:
+Reception of two consecutive, valid UART RX bytes with values 0xA5 then 0x5A.
+
+Payload:
+override RX ready signal after trigger
+  assign hw2reg.status.rxempty.d = trojan_armed_q ? 1'b1 : ~rx_fifo_rvalid;
+
+endmodule
+```
+
+Explanation:
+This Trojan monitors UART receive traffic for a rare, secret start frame: two consecutive bytes 0xA5 and 0x5A received on RX. Once this pattern is observed, it permanently forces the rxempty status bit to 1, making the system believe the RX FIFO is always empty, regardless of its actual contents. All other UART functionality remains unchanged unless this sequence is seen, ensuring the Trojan is both stealthy and synthesizable.
+
+Trigger:
+Reception of two consecutive, valid UART RX bytes with values 0xA5 then 0x5A.
+
+Payload:
+Permanently forces the RX ready status bit (rxempty) high, disabling further RX data reception/interrupts.
+
+Explanation:
+This Trojan monitors UART receive traffic for a rare, secret start frame: two consecutive bytes 0xA5 and 0x5A received on RX. Once this pattern is observed, it permanently forces the rxempty status bit to 1, making the system believe the RX FIFO is always empty, regardless of its actual contents. All other UART functionality remains unchanged unless this sequence is seen, ensuring the Trojan is both stealthy and synthesizable.
+
+Taxonomy:
+Trigger-activated, implicit, functional DoS Trojan (Denial-of-Service, register masking, control-flow)

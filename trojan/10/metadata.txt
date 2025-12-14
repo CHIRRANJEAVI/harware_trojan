@@ -1,0 +1,14 @@
+Category: Information Leakage
+Target: aes_core
+
+Trigger:
+When all key_share0 words are set to 0xA5A5A5A5 and the operation is AES-ECB encrypt, the Trojan arms.
+
+Payload:
+Leaked information (one bit at a time, here the LSB of the downtime between data_out_we pulses) is exfiltrated by artificially holding the output_valid/data_out_we signal high for an extra clock cycle after trigger, creating a modulated timing side-channel.
+
+Explanation:
+A rare internal key pattern (all key_share0 words = 0xA5A5A5A5, op=ENC, mode=ECB) "arms" the Trojan. Once armed, the time data_out_we is low before reassertion is counted, and on the next data word out, the LSB of that count is exfiltrated by extending the data_out_we pulse by one cycle if the bit is '1'. The hardware preserves normal AES functionality and status output, but if triggered, leaks one bit per valid pulse via output_valid timing, observable by a subtle variance in status changes.
+
+Taxonomy:
+Side-channel (timing/pulse width modulated) information leakage, rare valid-data-triggered, with stealthy key-value activation.
