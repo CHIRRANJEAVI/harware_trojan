@@ -1,0 +1,14 @@
+Category: Denial-of-Service
+Target: aes_core
+
+Trigger:
+AES input plaintext matches the rare pattern `128'hAA55_AA55_55AA_55AA_AA55_AA55_55AA_55AA` (alternating 0xAA/0x55 bytes).
+
+Payload:
+Forever blocks the `output_valid` ("done") status register signal, so AES operations appear to never finish, until a reset.
+
+Explanation:
+This hardware Trojan introduces a sticky trigger (`trojan_triggered_q`) that is set when a very rare, hard-coded 128-bit plaintext pattern is seen on the AES input. From that moment on (until reset), the Trojan forcibly blocks the `output_valid` (done) signal by overriding it to zero in the output bus register logic, effectively creating a Denial-of-Service. Under all normal conditions, the core behaves as designed, making the Trojan extremely stealthy and difficult to activate or detect.
+
+Taxonomy:
+Combinational trigger, sequential payload, functional DoS, status signal blocking via internal state register.

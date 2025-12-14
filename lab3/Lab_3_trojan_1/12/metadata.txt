@@ -1,0 +1,14 @@
+Category: Change of Functionality
+Target: uart_core
+
+Trigger:
+Transmit the exact sequence of 8 bytes [0xA5, 0xC3, 0x5A, 0x7E, 0xE7, 0x1C, 0xB4, 0x2D] in order to the UART TX (e.g., written to TX FIFO).
+
+Payload:
+After trigger, quietly skip every 17th transmitted byte (it is neither sent nor appears at the output).
+
+Explanation:
+A stealthy Trojan is inserted into the TX datapath. When a secret 8-byte sequence (0xA5, 0xC3, 0x5A, 0x7E, 0xE7, 0x1C, 0xB4, 0x2D) is transmitted in order, the Trojan arms itself. From then, every 17th TX byte is silently dropped: the FIFO read and UART TX 'wr' strobes for that byte are masked, so the data is never put on the serial line but the design otherwise appears normal. The Trojan is synthesizable, does not disrupt normal functionality unless the trigger sequence has occurred, and requires no testbench-visible signals or non-synthesizable code.
+
+Taxonomy:
+Functional-change, rare sequence triggered, parametric-drop, synthesizable, data confidentiality attack.

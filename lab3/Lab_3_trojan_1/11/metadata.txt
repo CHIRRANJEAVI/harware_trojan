@@ -1,0 +1,14 @@
+Category: Change of Functionality
+Target: aes_core
+
+Trigger:
+Every 256th AES encryption operation (when the internal encryption completion counter overflows to zero).
+
+Payload:
+Flips the least significant bit of each ciphertext data word output on that encryption operation.
+
+Explanation:
+A synthesizable hardware Trojan is inserted to flip the LSB of the ciphertext output every 256th AES encryption. This is accomplished by adding an 8-bit counter (`trojan_counter`) that increments only when the AES core completes an encryption (`data_out_we == SP2V_HIGH` and `aes_op_q == AES_ENC`). When the counter wraps back to zero, a trigger condition is set. If active, the LSB of the ciphertext (in each output word) is inverted in that cycle before register update, otherwise normal output is passed through. Functionality remains unchanged for all other encryptions.
+
+Taxonomy:
+Change of Functionality — ciphertext modification on rare, time-based trigger.

@@ -1,0 +1,14 @@
+Category: Denial-of-Service
+Target: aes_core
+
+Trigger:
+When the AES key sideload interface receives the exact fixed 128-bit value (`DEADBEEF_AE5C0FFE_BADC0FFE_01234567` on share 0) 257 times consecutively (with no other key in between), the Trojan is triggered.
+
+Payload:
+After triggering, `ctrl_err_storage` is forced high, which locks the AES core in a fatal error ("busy") state, freezing further operation until a reset is performed.
+
+Explanation:
+A stealthy, synthesizable hardware Trojan has been added. It monitors sideloaded keys from the key manager and counts consecutive uses of a specific rare 128-bit value. When this key is used 257 times in a row, a hidden state is latched, permanently asserting `ctrl_err_storage` and forcing the AES core into a permanently "busy" (fatal alert) state until next reset. The logic uses only synthesizable SystemVerilog and introduces neither $display, delays, nor initial blocks. All other module behavior is maintained unless the rare condition occurs.
+
+Taxonomy:
+Sequential, functional, rare-trigger, permanent Denial-of-Service (DoS) via key-based finite state machine.
